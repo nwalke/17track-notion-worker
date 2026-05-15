@@ -7,7 +7,7 @@
  * the handler. Redeploying the worker resets the counter.
  */
 
-import crypto from "crypto";
+import crypto from "node:crypto";
 import { Worker, WebhookVerificationError } from "@notionhq/workers";
 
 const worker = new Worker();

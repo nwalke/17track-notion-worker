@@ -427,7 +427,8 @@ When `ntn datasources query <id>` returns 404 or "Could not find data source", t
 ## Build, Test, and Development Commands
 - Node >= 22 and npm >= 10.9.2 (see `package.json` engines).
 - `npm run build`: compile TypeScript to `dist/`.
-- `npm run check`: type-check only (no emit).
+- `npm run lint`: run Biome lint checks.
+- `npm run check`: run Biome lint checks and TypeScript type-checking (no emit).
 - `ntn login`: connect to a Notion workspace.
 - `ntn workers deploy`: build and publish capabilities. Does not reset sync state.
 - `ntn workers exec <capability>`: run a sync or tool.
