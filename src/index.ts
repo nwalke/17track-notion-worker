@@ -17,6 +17,7 @@ const TRACK17_RATE_LIMIT = worker.pacer("track17Api", {
 });
 const carrierNameCache = new Map<number, string>();
 let carrierListPromise: Promise<Map<number, string>> | undefined;
+let carrierListItemsPromise: Promise<CarrierListItem[]> | undefined;
 
 const PACKAGE_STATUS_OPTIONS = [
 	{ name: "Unknown", color: "default" },
@@ -120,9 +121,16 @@ type RegisterAcceptedItem = {
 	lang?: string | null;
 };
 
+type TrackingNumberActionAcceptedItem = {
+	number: string;
+	carrier?: number | string;
+};
+
 type CarrierListItem = {
 	key?: number;
 	_name?: string;
+	_country_iso?: string;
+	_url?: string | null;
 };
 
 type TrackListItem = {
@@ -236,83 +244,57 @@ worker.sync("shipmentsSync", {
 	},
 });
 
+worker.tool("searchCarrierCodes", {
+	title: "Search 17TRACK Carrier Codes",
+	description: "Search the 17TRACK carrier list and return carrier codes that can be used with addTrackingNumberWithCarrier.",
+	schema: j.object({
+		query: j.string().describe("Carrier name or country code to search for, such as FedEx, China Post, USPS, or CN."),
+	}),
+	execute: async ({ query }) => {
+		const normalizedQuery = query.trim().toLowerCase();
+		const carriers = await getCarrierListItems();
+		const matches = carriers
+			.filter((carrier) => {
+				const name = carrier._name?.toLowerCase() ?? "";
+				const country = carrier._country_iso?.toLowerCase() ?? "";
+				const key = typeof carrier.key === "number" ? String(carrier.key) : "";
+				return name.includes(normalizedQuery) || country === normalizedQuery || key === normalizedQuery;
+			})
+			.slice(0, 10)
+			.map((carrier) => ({
+				carrierCode: carrier.key ?? null,
+				name: carrier._name ?? "",
+				countryCode: carrier._country_iso ?? null,
+				url: carrier._url ?? null,
+			}));
+
+		return {
+			query,
+			count: matches.length,
+			matches,
+		};
+	},
+});
+
 worker.tool("addTrackingNumber", {
 	title: "Add 17TRACK Tracking Number",
 	description:
 		"Register a package tracking number with 17TRACK so it is tracked and synced into the 17TRACK Shipments database.",
 	schema: j.object({
-		trackingNumber: j.string().describe("Package tracking number to register."),
-		carrierCode: j
-			.integer()
-			.nullable()
-			.describe("Optional 17TRACK carrier code. Use null to let 17TRACK detect the carrier."),
-		finalCarrierCode: j
-			.integer()
-			.nullable()
-			.describe("Optional last-mile carrier code for UPU shipments. Use null when not needed."),
-		originCountry: j
-			.string()
-			.nullable()
-			.describe("Optional ISO 3166-1 alpha-2 origin country code, such as US or CN."),
-		destinationCountry: j
-			.string()
-			.nullable()
-			.describe("Optional ISO 3166-1 alpha-2 destination country code, such as US or CN."),
-		destinationPostalCode: j
-			.string()
-			.nullable()
-			.describe("Optional destination postal code required by some carriers."),
-		shipDate: j.string().nullable().describe("Optional shipping date in YYYY/MM/DD format required by some carriers."),
-		phoneNumberLast4: j
-			.string()
-			.nullable()
-			.describe("Optional last four phone-number digits required by some carriers."),
-		phoneNumber: j.string().nullable().describe("Optional full phone number required by some carriers."),
-		tag: j
-			.string()
-			.nullable()
-			.describe("Optional label stored in 17TRACK, such as order ID, vendor, or item name."),
-		remark: j.string().nullable().describe("Optional 17TRACK remark."),
-		autoDetection: j
-			.boolean()
-			.nullable()
-			.describe("Whether 17TRACK should try automatic carrier detection when carrierCode is null."),
+		trackingNumber: j.string().describe("Package tracking number to register. 17TRACK carrier auto-detection is enabled."),
 	}),
-	execute: async ({
-		trackingNumber,
-		carrierCode,
-		finalCarrierCode,
-		originCountry,
-		destinationCountry,
-		destinationPostalCode,
-		shipDate,
-		phoneNumberLast4,
-		phoneNumber,
-		tag,
-		remark,
-		autoDetection,
-	}) => {
+	execute: async ({ trackingNumber }) => {
 		const request: Record<string, string | number | boolean> = {
 			number: trackingNumber.trim(),
+			auto_detection: true,
 		};
-
-		if (carrierCode !== null) request.carrier = carrierCode;
-		if (finalCarrierCode !== null) request.final_carrier = finalCarrierCode;
-		if (originCountry?.trim()) request.origin_country = originCountry.trim().toUpperCase();
-		if (destinationCountry?.trim()) request.destination_country = destinationCountry.trim().toUpperCase();
-		if (destinationPostalCode?.trim()) request.destination_postal_code = destinationPostalCode.trim();
-		if (shipDate?.trim()) request.ship_date = shipDate.trim();
-		if (phoneNumberLast4?.trim()) request.phone_number_last_4 = phoneNumberLast4.trim();
-		if (phoneNumber?.trim()) request.phone_number = phoneNumber.trim();
-		if (tag?.trim()) request.tag = tag.trim();
-		if (remark?.trim()) request.remark = remark.trim();
-		if (autoDetection !== null) request.auto_detection = autoDetection;
 
 		const response = await callTrack17<BatchResponse<RegisterAcceptedItem>>("/register", [request]);
 		const accepted = response.data.accepted ?? [];
 		const rejected = response.data.rejected ?? [];
 
 		return {
+			message: addTrackingNumberResultMessage(accepted.length),
 			acceptedCount: accepted.length,
 			rejectedCount: rejected.length,
 			accepted: accepted.map((item) => ({
@@ -330,6 +312,87 @@ worker.tool("addTrackingNumber", {
 		};
 	},
 });
+
+worker.tool("addTrackingNumberWithCarrier", {
+	title: "Add 17TRACK Tracking Number With Carrier",
+	description:
+		"Register a package tracking number with 17TRACK using a specific 17TRACK carrier code from searchCarrierCodes.",
+	schema: j.object({
+		trackingNumber: j.string().describe("Package tracking number to register."),
+		carrierCode: j.integer().describe("17TRACK carrier code returned by searchCarrierCodes."),
+	}),
+	execute: async ({ trackingNumber, carrierCode }) => {
+		const response = await callTrack17<BatchResponse<RegisterAcceptedItem>>("/register", [
+			{ number: trackingNumber.trim(), carrier: carrierCode },
+		]);
+		const accepted = response.data.accepted ?? [];
+		const rejected = response.data.rejected ?? [];
+
+		return {
+			message: addTrackingNumberResultMessage(accepted.length),
+			acceptedCount: accepted.length,
+			rejectedCount: rejected.length,
+			accepted: accepted.map((item) => ({
+				trackingNumber: item.number,
+				carrierCode: item.carrier ?? null,
+				origin: item.origin ?? null,
+				trackingUrl: trackingUrl(item.number),
+			})),
+			rejected: rejected.map((item) => ({
+				trackingNumber: item.number ?? trackingNumber,
+				carrierCode: item.carrier ?? null,
+				errorCode: item.error?.code ?? null,
+				message: item.error?.message ?? "Rejected by 17TRACK.",
+			})),
+		};
+	},
+});
+
+worker.tool("removeTrackingNumber", {
+	title: "Remove 17TRACK Tracking Number",
+	description:
+		"Delete a package tracking number from 17TRACK. The shipment will be removed from the synced Notion database on the next shipmentsSync run.",
+	schema: j.object({
+		trackingNumber: j.string().describe("Package tracking number to delete from 17TRACK."),
+	}),
+	execute: async ({ trackingNumber }) => {
+		const response = await callTrack17<BatchResponse<TrackingNumberActionAcceptedItem>>("/deletetrack", [
+			{ number: trackingNumber.trim() },
+		]);
+		const accepted = response.data.accepted ?? [];
+		const rejected = response.data.rejected ?? [];
+
+		return {
+			message: removeTrackingNumberResultMessage(accepted.length),
+			acceptedCount: accepted.length,
+			rejectedCount: rejected.length,
+			accepted: accepted.map((item) => ({
+				trackingNumber: item.number,
+				carrierCode: item.carrier ?? null,
+			})),
+			rejected: rejected.map((item) => ({
+				trackingNumber: item.number ?? trackingNumber,
+				carrierCode: item.carrier ?? null,
+				errorCode: item.error?.code ?? null,
+				message: item.error?.message ?? "Rejected by 17TRACK.",
+			})),
+		};
+	},
+});
+
+function addTrackingNumberResultMessage(acceptedCount: number): string {
+	if (acceptedCount === 0) return "No tracking numbers were registered. See rejected for 17TRACK errors.";
+	return `Tracking number registered with 17TRACK. 17TRACK may take up to 5 minutes to return tracking results; after that, it will appear in Notion on the next shipmentsSync run based on SHIPMENTS_SYNC_SCHEDULE (${getConfiguredShipmentsSyncScheduleLabel()}).`;
+}
+
+function removeTrackingNumberResultMessage(acceptedCount: number): string {
+	if (acceptedCount === 0) return "No tracking numbers were removed. See rejected for 17TRACK errors.";
+	return `Tracking number removed from 17TRACK. It will disappear from Notion on the next shipmentsSync run based on SHIPMENTS_SYNC_SCHEDULE (${getConfiguredShipmentsSyncScheduleLabel()}).`;
+}
+
+function getConfiguredShipmentsSyncScheduleLabel(): string {
+	return process.env[SHIPMENTS_SYNC_SCHEDULE_ENV]?.trim() || DEFAULT_SHIPMENTS_SYNC_SCHEDULE;
+}
 
 function toShipmentUpsert(item: TrackListItem, details: TrackInfoItem[], carrierNames: ReadonlyMap<number, string>) {
 	const detail = findTrackInfo(details, item);
@@ -456,14 +519,13 @@ async function getCarrierList(): Promise<Map<number, string>> {
 	return carrierListPromise;
 }
 
-async function fetchCarrierList(): Promise<Map<number, string>> {
-	const response = await fetch(TRACK17_CARRIER_LIST_URL);
-	const text = await response.text();
-	if (!response.ok) {
-		throw new Error(`17TRACK carrier list failed with HTTP ${response.status}: ${text}`);
-	}
+async function getCarrierListItems(): Promise<CarrierListItem[]> {
+	carrierListItemsPromise ??= fetchCarrierListItems();
+	return carrierListItemsPromise;
+}
 
-	const items = JSON.parse(text) as CarrierListItem[];
+async function fetchCarrierList(): Promise<Map<number, string>> {
+	const items = await getCarrierListItems();
 	const carriers = new Map<number, string>();
 	for (const item of items) {
 		if (typeof item.key === "number" && item._name?.trim()) {
@@ -471,6 +533,16 @@ async function fetchCarrierList(): Promise<Map<number, string>> {
 		}
 	}
 	return carriers;
+}
+
+async function fetchCarrierListItems(): Promise<CarrierListItem[]> {
+	const response = await fetch(TRACK17_CARRIER_LIST_URL);
+	const text = await response.text();
+	if (!response.ok) {
+		throw new Error(`17TRACK carrier list failed with HTTP ${response.status}: ${text}`);
+	}
+
+	return JSON.parse(text) as CarrierListItem[];
 }
 
 async function callTrack17<T>(path: string, body: unknown): Promise<ApiEnvelope<T>> {
