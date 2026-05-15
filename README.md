@@ -37,7 +37,10 @@ npm run check
 ntn login
 ntn workers create --name track17
 ntn workers env set TRACK17_API_TOKEN=your-17track-access-key
-ntn workers env set SHIPMENTS_SYNC_SCHEDULE=1h
+
+# Optionally set the sync to whatever you want, default is 1 hour
+ntn workers env set SHIPMENTS_SYNC_SCHEDULE=30m
+
 ntn workers deploy
 ```
 
