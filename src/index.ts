@@ -304,13 +304,24 @@ worker.tool("addTrackingNumber", {
   description:
     "Register a package tracking number with 17TRACK so it is tracked and synced into the 17TRACK Shipments database.",
   schema: j.object({
-    trackingNumber: j.string().describe("Package tracking number to register. 17TRACK carrier auto-detection is enabled."),
+    trackingNumber: j.string().describe("Package tracking number to register."),
+    carrierCode: j
+      .integer()
+      .nullable()
+      .describe(
+        "Optional 17TRACK carrier code returned by searchCarrierCodes. Use null to let 17TRACK detect the carrier.",
+      ),
   }),
-  execute: async ({ trackingNumber }) => {
+  execute: async ({ trackingNumber, carrierCode }) => {
     const request: Record<string, string | number | boolean> = {
       number: trackingNumber.trim(),
-      auto_detection: true,
     };
+
+    if (carrierCode == null) {
+      request.auto_detection = true;
+    } else {
+      request.carrier = carrierCode;
+    }
 
     const response = await callTrack17<BatchResponse<RegisterAcceptedItem>>(
       "/register",
@@ -331,43 +342,7 @@ worker.tool("addTrackingNumber", {
       })),
       rejected: rejected.map((item) => ({
         trackingNumber: item.number ?? trackingNumber,
-        carrierCode: item.carrier ?? null,
-        errorCode: item.error?.code ?? null,
-        message: item.error?.message ?? "Rejected by 17TRACK.",
-      })),
-    };
-  },
-});
-
-worker.tool("addTrackingNumberWithCarrier", {
-  title: "Add 17TRACK Tracking Number With Carrier",
-  description:
-    "Register a package tracking number with 17TRACK using a specific 17TRACK carrier code from searchCarrierCodes.",
-  schema: j.object({
-    trackingNumber: j.string().describe("Package tracking number to register."),
-    carrierCode: j.integer().describe("17TRACK carrier code returned by searchCarrierCodes."),
-  }),
-  execute: async ({ trackingNumber, carrierCode }) => {
-    const response = await callTrack17<BatchResponse<RegisterAcceptedItem>>(
-      "/register",
-      [{ number: trackingNumber.trim(), carrier: carrierCode }],
-    );
-    const accepted = response.data.accepted ?? [];
-    const rejected = response.data.rejected ?? [];
-
-    return {
-      message: addTrackingNumberResultMessage(accepted.length),
-      acceptedCount: accepted.length,
-      rejectedCount: rejected.length,
-      accepted: accepted.map((item) => ({
-        trackingNumber: item.number,
-        carrierCode: item.carrier ?? null,
-        origin: item.origin ?? null,
-        trackingUrl: trackingUrl(item.number),
-      })),
-      rejected: rejected.map((item) => ({
-        trackingNumber: item.number ?? trackingNumber,
-        carrierCode: item.carrier ?? null,
+        carrierCode: item.carrier ?? carrierCode ?? null,
         errorCode: item.error?.code ?? null,
         message: item.error?.message ?? "Rejected by 17TRACK.",
       })),

@@ -8,8 +8,7 @@ A self-deployable Notion Worker that syncs 17TRACK v2.4 registrations into a man
 | --- | --- | --- |
 | `shipmentsSync` | Sync | Replace-mode sync of 17TRACK registrations into the managed `17TRACK Shipments` database. |
 | `searchCarrierCodes` | Tool | Searches 17TRACK carrier codes by carrier name, country code, or carrier code. |
-| `addTrackingNumber` | Tool | Registers a package tracking number with 17TRACK auto-detection and returns accepted/rejected records. |
-| `addTrackingNumberWithCarrier` | Tool | Registers a package tracking number with an explicit 17TRACK carrier code and returns accepted/rejected records. |
+| `addTrackingNumber` | Tool | Registers a package tracking number with optional 17TRACK carrier code and returns accepted/rejected records. |
 | `removeTrackingNumber` | Tool | Deletes a package tracking number from 17TRACK and returns accepted/rejected records. |
 
 ## Requirements
@@ -72,18 +71,19 @@ ntn workers exec searchCarrierCodes --local -d '{
 }'
 ```
 
-Run the auto-detect add tool locally:
+Run the add tool locally with 17TRACK carrier auto-detection:
 
 ```sh
 ntn workers exec addTrackingNumber --local -d '{
-  "trackingNumber": "RR123456789CN"
+  "trackingNumber": "RR123456789CN",
+  "carrierCode": null
 }'
 ```
 
-Run the explicit-carrier add tool locally:
+Run the add tool locally with an explicit carrier code:
 
 ```sh
-ntn workers exec addTrackingNumberWithCarrier --local -d '{
+ntn workers exec addTrackingNumber --local -d '{
   "trackingNumber": "RR123456789CN",
   "carrierCode": 3011
 }'
@@ -119,18 +119,19 @@ ntn workers exec searchCarrierCodes -d '{
 }'
 ```
 
-Run the deployed auto-detect add tool:
+Run the deployed add tool with 17TRACK carrier auto-detection:
 
 ```sh
 ntn workers exec addTrackingNumber -d '{
-  "trackingNumber": "RR123456789CN"
+  "trackingNumber": "RR123456789CN",
+  "carrierCode": null
 }'
 ```
 
-Run the deployed explicit-carrier add tool:
+Run the deployed add tool with an explicit carrier code:
 
 ```sh
-ntn workers exec addTrackingNumberWithCarrier -d '{
+ntn workers exec addTrackingNumber -d '{
   "trackingNumber": "RR123456789CN",
   "carrierCode": 3011
 }'
@@ -185,8 +186,7 @@ Synced properties include tracking number, 17TRACK URL, package status, tracking
 - Carrier names are resolved from `https://res.17track.net/asset/carrier/info/apicarrier.all.json`; the worker fetches the carrier list once per runtime and caches resolved code-to-name values.
 - Estimated delivery is read from `track_info.time_metrics.estimated_delivery_date`; the raw `from`/`to` value is synced into `Estimated Delivery Value`, and `Estimated Delivery Date` plus `Estimated Delivery Window` are only filled when the range parses successfully.
 - `searchCarrierCodes` reads `https://res.17track.net/asset/carrier/info/apicarrier.all.json` and returns matching carrier codes.
-- `addTrackingNumber` writes to `/register` with 17TRACK carrier auto-detection enabled and returns accepted/rejected records from 17TRACK.
-- `addTrackingNumberWithCarrier` writes to `/register` with an explicit carrier code from `searchCarrierCodes` and returns accepted/rejected records from 17TRACK.
+- `addTrackingNumber` writes to `/register` with an optional carrier code from `searchCarrierCodes`; set `carrierCode` to `null` to enable 17TRACK carrier auto-detection.
 - `removeTrackingNumber` writes to `/deletetrack` and returns accepted/rejected records from 17TRACK; deletion is irreversible in 17TRACK, and the record disappears from Notion on the next replace-mode sync.
 
 ## Troubleshooting
