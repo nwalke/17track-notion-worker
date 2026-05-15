@@ -1,4 +1,4 @@
-import { RateLimitError, Worker } from "@notionhq/workers";
+import { RateLimitError, Worker, type Schedule } from "@notionhq/workers";
 import * as Builder from "@notionhq/workers/builder";
 import * as Schema from "@notionhq/workers/schema";
 import { j } from "@notionhq/workers/schema-builder";
@@ -6,43 +6,49 @@ import { j } from "@notionhq/workers/schema-builder";
 const worker = new Worker();
 export default worker;
 
-const TRACK17_API_BASE_URL = "https://api.17track.net/track/v1";
+const TRACK17_API_BASE_URL = "https://api.17track.net/track/v2.4";
+const TRACK17_CARRIER_LIST_URL = "https://res.17track.net/asset/carrier/info/apicarrier.all.json";
 const TRACK17_TOKEN_ENV = "TRACK17_API_TOKEN";
+const SHIPMENTS_SYNC_SCHEDULE_ENV = "SHIPMENTS_SYNC_SCHEDULE";
+const DEFAULT_SHIPMENTS_SYNC_SCHEDULE = "1h";
 const TRACK17_RATE_LIMIT = worker.pacer("track17Api", {
 	allowedRequests: 3,
 	intervalMs: 1000,
 });
+const carrierNameCache = new Map<number, string>();
+let carrierListPromise: Promise<Map<number, string>> | undefined;
 
 const PACKAGE_STATUS_OPTIONS = [
 	{ name: "Unknown", color: "default" },
-	{ name: "Not found", color: "gray" },
-	{ name: "In transit", color: "blue" },
+	{ name: "NotFound", color: "gray" },
+	{ name: "InfoReceived", color: "gray" },
+	{ name: "InTransit", color: "blue" },
 	{ name: "Expired", color: "gray" },
-	{ name: "Pick up", color: "purple" },
-	{ name: "Undelivered", color: "orange" },
+	{ name: "AvailableForPickup", color: "purple" },
+	{ name: "OutForDelivery", color: "blue" },
+	{ name: "DeliveryFailure", color: "orange" },
 	{ name: "Delivered", color: "green" },
-	{ name: "Alert", color: "red" },
+	{ name: "Exception", color: "red" },
 ] as const;
 
 const TRACKING_STATUS_OPTIONS = [
 	{ name: "Unknown", color: "default" },
-	{ name: "Unable to track", color: "gray" },
-	{ name: "Normal tracking", color: "blue" },
-	{ name: "Not found", color: "gray" },
-	{ name: "Web error", color: "orange" },
-	{ name: "Process error", color: "orange" },
-	{ name: "Service error", color: "red" },
-	{ name: "Web error (cache)", color: "orange" },
-	{ name: "Process error (cache)", color: "orange" },
-	{ name: "Service error (cache)", color: "red" },
+	{ name: "Tracking", color: "blue" },
+	{ name: "Stopped", color: "gray" },
 ] as const;
 
 const STOP_REASON_OPTIONS = [
 	{ name: "None", color: "default" },
-	{ name: "Expiration rules", color: "gray" },
-	{ name: "API request", color: "orange" },
-	{ name: "Manual operation", color: "orange" },
-	{ name: "Invalid carrier", color: "red" },
+	{ name: "Expired", color: "gray" },
+	{ name: "ByRequest", color: "orange" },
+	{ name: "InvalidCarrier", color: "red" },
+] as const;
+
+const ESTIMATED_DELIVERY_SOURCE_OPTIONS = [
+	{ name: "None", color: "default" },
+	{ name: "Official", color: "green" },
+	{ name: "17TRACK", color: "blue" },
+	{ name: "Unknown", color: "gray" },
 ] as const;
 
 const shipments = worker.database("shipments", {
@@ -53,28 +59,34 @@ const shipments = worker.database("shipments", {
 		databaseIcon: Builder.emojiIcon("📦"),
 		properties: {
 			Name: Schema.title(),
+			"Carrier Name": Schema.richText(),
+			"Package Status": Schema.select([...PACKAGE_STATUS_OPTIONS]),
+			"Estimated Delivery Date": Schema.date(),
+			"Estimated Delivery Window": Schema.richText(),
+			"Latest Event": Schema.richText(),
+			"Latest Event Location": Schema.richText(),
+			"Latest Event At": Schema.date(),
+			"Picked Up At": Schema.date(),
 			"Tracking Key": Schema.richText(),
 			"Tracking Number": Schema.richText(),
 			"17TRACK URL": Schema.url(),
-			"Package Status": Schema.select([...PACKAGE_STATUS_OPTIONS]),
 			"Tracking Status": Schema.select([...TRACKING_STATUS_OPTIONS]),
 			"Tracking Active": Schema.checkbox(),
 			"Carrier Code": Schema.number(),
 			"Last-mile Carrier Code": Schema.number(),
-			"Origin Country Code": Schema.number(),
-			"Destination Country Code": Schema.number(),
+			"Last-mile Carrier Name": Schema.richText(),
+			"Origin Country": Schema.richText(),
+			"Destination Country": Schema.richText(),
 			"Registered At": Schema.date(),
 			"Last Tracked At": Schema.date(),
-			"Last Pushed At": Schema.date(),
 			"Stopped At": Schema.date(),
+			"Delivered At": Schema.date(),
+			"Estimated Delivery Value": Schema.richText(),
+			"Estimated Delivery Source": Schema.select([...ESTIMATED_DELIVERY_SOURCE_OPTIONS]),
 			"Stop Reason": Schema.select([...STOP_REASON_OPTIONS]),
-			"Can Retrack": Schema.checkbox(),
+			"Retracked": Schema.checkbox(),
 			"Carrier Changes": Schema.number(),
-			"Push HTTP Status": Schema.number(),
-			Tag: Schema.richText(),
-			"Latest Event At": Schema.date(),
-			"Latest Event Location": Schema.richText(),
-			"Latest Event": Schema.richText(),
+			Remark: Schema.richText(),
 		},
 	},
 });
@@ -82,11 +94,17 @@ const shipments = worker.database("shipments", {
 type ApiEnvelope<T> = {
 	code: number;
 	data: T;
+	page?: {
+		data_total?: number;
+		page_total?: number;
+		page_no?: number;
+		page_size?: number;
+	};
 };
 
 type RejectedTrack17Item = {
 	number?: string;
-	carrier?: number;
+	carrier?: number | string;
 	error?: {
 		code?: number;
 		message?: string;
@@ -97,53 +115,79 @@ type RegisterAcceptedItem = {
 	origin?: number;
 	number: string;
 	carrier?: number;
+	tag?: string | null;
+	email?: string | null;
+	lang?: string | null;
+};
+
+type CarrierListItem = {
+	key?: number;
+	_name?: string;
 };
 
 type TrackListItem = {
 	number: string;
-	w1?: number;
-	w2?: number;
-	b?: number;
-	c?: number;
-	e?: number;
-	rt?: string;
-	tt?: string;
-	pt?: string;
-	ps?: number;
-	st?: string;
-	sr?: number;
-	ir?: boolean;
-	ts?: boolean;
-	mc?: number;
+	carrier?: number;
+	final_carrier?: number;
+	shipping_country?: string | null;
+	recipient_country?: string | null;
+	origin_country?: string | null;
+	destination_country?: string | null;
+	register_time?: string | null;
+	tracking_status?: string | null;
+	package_status?: string | number | null;
+	track_time?: string | null;
+	stop_track_time?: string | null;
+	stop_track_reason?: string | null;
+	is_retracked?: boolean;
+	carrier_change_count?: number;
 	tag?: string | null;
+	order_time?: string | null;
+	remark?: string | null;
+	latest_event_time?: string | null;
+	latest_event_info?: string | null;
+	delievery_time?: string | null;
+	delivery_time?: string | null;
+	pickup_time?: string | null;
+	track_info?: TrackInfo | null;
 };
 
 type TrackEvent = {
-	a?: string;
-	c?: string;
-	z?: string;
+	time_iso?: string | null;
+	time_utc?: string | null;
+	description?: string | null;
+	description_translation?: {
+		lang?: string | null;
+		description?: string | null;
+	} | null;
+	location?: string | null;
+	stage?: string | null;
+	sub_status?: string | null;
 };
 
-type TrackDetails = {
-	b?: number;
-	c?: number;
-	e?: number;
-	f?: number;
-	w1?: number;
-	w2?: number;
-	z0?: TrackEvent | null;
-	is1?: number;
-	is2?: number;
-	ylt1?: string;
-	ylt2?: string;
-	yt?: string;
+type EstimatedDeliveryDate = {
+	source?: string | null;
+	from?: string | null;
+	to?: string | null;
 };
 
-type TrackInfoItem = {
-	number: string;
-	tag?: string | null;
-	track?: TrackDetails;
+type TrackInfo = {
+	latest_status?: {
+		status?: string | null;
+		sub_status?: string | null;
+		sub_status_descr?: string | null;
+	} | null;
+	latest_event?: TrackEvent | null;
+	time_metrics?: {
+		days_after_order?: number | null;
+		days_after_last_update?: number | null;
+		days_of_transit?: number | null;
+		days_of_transit_done?: number | null;
+		estimated_delivery_date?: EstimatedDeliveryDate | null;
+	} | null;
 };
+
+type TrackInfoItem = TrackListItem;
 
 type BatchResponse<TAccepted> = {
 	accepted?: TAccepted[];
@@ -153,68 +197,41 @@ type BatchResponse<TAccepted> = {
 
 type ShipmentsSyncState = {
 	page: number;
+	pageSignatures?: string[];
+};
+
+type TrackListPage = {
+	items: TrackListItem[];
+	pageTotal?: number;
 };
 
 worker.sync("shipmentsSync", {
 	database: shipments,
 	mode: "replace",
-	schedule: "30m",
+	schedule: getShipmentsSyncSchedule(),
 	execute: async (state: ShipmentsSyncState | undefined) => {
 		const page = state?.page ?? 1;
-		const tracked = await getTrackedShipmentsPage(page);
+		const pageResult = await getTrackedShipmentsPage(page);
+		const tracked = pageResult.items;
 
 		if (tracked.length === 0) {
 			return { changes: [], hasMore: false };
 		}
 
+		const pageSignature = trackListPageSignature(tracked);
+		if (state?.pageSignatures?.includes(pageSignature)) {
+			console.warn(`17TRACK gettracklist returned a repeated page at page ${page}; ending sync cycle.`);
+			return { changes: [], hasMore: false };
+		}
+
 		const details = await getTrackInfoFor(tracked);
+		const carrierNames = await getCarrierNamesFor(collectCarrierCodes(tracked, details));
+		const hasMore = pageResult.pageTotal ? page < pageResult.pageTotal : true;
 
 		return {
-			changes: tracked.map((item) => {
-				const detail = findTrackInfo(details, item);
-				const track = detail?.track;
-				const carrier = firstNumber(item.w1, track?.w1);
-				const lastMileCarrier = firstNumber(item.w2, track?.w2);
-				const originCountry = firstNumber(item.b, track?.b);
-				const destinationCountry = firstNumber(item.c, track?.c);
-				const packageStatusCode = firstNumber(item.e, track?.e);
-				const latestEvent = track?.z0 ?? undefined;
-				const upstreamUpdatedAt = toIsoDateTime(item.tt ?? track?.ylt1 ?? latestEvent?.a);
-
-				return {
-					type: "upsert" as const,
-					key: trackingKey(item.number, carrier),
-					upstreamUpdatedAt: upstreamUpdatedAt ?? undefined,
-					icon: packageStatusIcon(packageStatusCode),
-					properties: {
-						Name: Builder.title(item.number),
-						"Tracking Key": Builder.richText(trackingKey(item.number, carrier)),
-						"Tracking Number": Builder.richText(item.number),
-						"17TRACK URL": Builder.url(trackingUrl(item.number)),
-						"Package Status": Builder.select(packageStatusName(packageStatusCode)),
-						"Tracking Status": Builder.select(trackingStatusName(track?.is1)),
-						"Tracking Active": Builder.checkbox(item.ts ?? true),
-						"Carrier Code": optionalNumber(carrier),
-						"Last-mile Carrier Code": optionalNumber(lastMileCarrier),
-						"Origin Country Code": optionalNumber(originCountry),
-						"Destination Country Code": optionalNumber(destinationCountry),
-						"Registered At": optionalDateTime(item.rt),
-						"Last Tracked At": optionalDateTime(item.tt ?? track?.ylt1),
-						"Last Pushed At": optionalDateTime(item.pt),
-						"Stopped At": optionalDateTime(item.st),
-						"Stop Reason": Builder.select(stopReasonName(item.sr)),
-						"Can Retrack": Builder.checkbox(item.ir ?? false),
-						"Carrier Changes": optionalNumber(item.mc),
-						"Push HTTP Status": optionalNumber(item.ps),
-						Tag: Builder.richText(item.tag ?? detail?.tag ?? ""),
-						"Latest Event At": optionalDateTime(latestEvent?.a),
-						"Latest Event Location": Builder.richText(latestEvent?.c ?? ""),
-						"Latest Event": Builder.richText(latestEvent?.z ?? track?.yt ?? ""),
-					},
-				};
-			}),
-			hasMore: true,
-			nextState: { page: page + 1 },
+			changes: tracked.map((item) => toShipmentUpsert(item, details, carrierNames)),
+			hasMore,
+			nextState: hasMore ? { page: page + 1, pageSignatures: [...(state?.pageSignatures ?? []), pageSignature] } : undefined,
 		};
 	},
 });
@@ -233,31 +250,64 @@ worker.tool("addTrackingNumber", {
 			.integer()
 			.nullable()
 			.describe("Optional last-mile carrier code for UPU shipments. Use null when not needed."),
-		extraParam: j
+		originCountry: j
 			.string()
 			.nullable()
-			.describe("Optional carrier-required extra parameter, such as postcode, order date, or phone suffix."),
+			.describe("Optional ISO 3166-1 alpha-2 origin country code, such as US or CN."),
+		destinationCountry: j
+			.string()
+			.nullable()
+			.describe("Optional ISO 3166-1 alpha-2 destination country code, such as US or CN."),
+		destinationPostalCode: j
+			.string()
+			.nullable()
+			.describe("Optional destination postal code required by some carriers."),
+		shipDate: j.string().nullable().describe("Optional shipping date in YYYY/MM/DD format required by some carriers."),
+		phoneNumberLast4: j
+			.string()
+			.nullable()
+			.describe("Optional last four phone-number digits required by some carriers."),
+		phoneNumber: j.string().nullable().describe("Optional full phone number required by some carriers."),
 		tag: j
 			.string()
 			.nullable()
 			.describe("Optional label stored in 17TRACK, such as order ID, vendor, or item name."),
+		remark: j.string().nullable().describe("Optional 17TRACK remark."),
 		autoDetection: j
 			.boolean()
 			.nullable()
 			.describe("Whether 17TRACK should try automatic carrier detection when carrierCode is null."),
 	}),
-	execute: async ({ trackingNumber, carrierCode, finalCarrierCode, extraParam, tag, autoDetection }) => {
+	execute: async ({
+		trackingNumber,
+		carrierCode,
+		finalCarrierCode,
+		originCountry,
+		destinationCountry,
+		destinationPostalCode,
+		shipDate,
+		phoneNumberLast4,
+		phoneNumber,
+		tag,
+		remark,
+		autoDetection,
+	}) => {
 		const request: Record<string, string | number | boolean> = {
 			number: trackingNumber.trim(),
 		};
 
 		if (carrierCode !== null) request.carrier = carrierCode;
 		if (finalCarrierCode !== null) request.final_carrier = finalCarrierCode;
-		if (extraParam?.trim()) request.extra_param = extraParam.trim();
+		if (originCountry?.trim()) request.origin_country = originCountry.trim().toUpperCase();
+		if (destinationCountry?.trim()) request.destination_country = destinationCountry.trim().toUpperCase();
+		if (destinationPostalCode?.trim()) request.destination_postal_code = destinationPostalCode.trim();
+		if (shipDate?.trim()) request.ship_date = shipDate.trim();
+		if (phoneNumberLast4?.trim()) request.phone_number_last_4 = phoneNumberLast4.trim();
+		if (phoneNumber?.trim()) request.phone_number = phoneNumber.trim();
 		if (tag?.trim()) request.tag = tag.trim();
+		if (remark?.trim()) request.remark = remark.trim();
 		if (autoDetection !== null) request.auto_detection = autoDetection;
 
-		await TRACK17_RATE_LIMIT.wait();
 		const response = await callTrack17<BatchResponse<RegisterAcceptedItem>>("/register", [request]);
 		const accepted = response.data.accepted ?? [];
 		const rejected = response.data.rejected ?? [];
@@ -281,14 +331,77 @@ worker.tool("addTrackingNumber", {
 	},
 });
 
-async function getTrackedShipmentsPage(page: number): Promise<TrackListItem[]> {
+function toShipmentUpsert(item: TrackListItem, details: TrackInfoItem[], carrierNames: ReadonlyMap<number, string>) {
+	const detail = findTrackInfo(details, item);
+	const trackInfo = detail?.track_info ?? item.track_info ?? undefined;
+	const latestEvent = trackInfo?.latest_event ?? undefined;
+	const carrier = firstNumber(item.carrier, detail?.carrier);
+	const lastMileCarrier = firstNumber(item.final_carrier, detail?.final_carrier);
+	const packageStatus = packageStatusName(trackInfo?.latest_status?.status ?? detail?.package_status ?? item.package_status);
+	const trackingStatus = trackingStatusName(detail?.tracking_status ?? item.tracking_status);
+	const estimatedDelivery = trackInfo?.time_metrics?.estimated_delivery_date ?? undefined;
+	const estimatedDeliveryParsed = parseEstimatedDelivery(estimatedDelivery);
+	const estimatedDeliveryValue = estimatedDeliveryRawValue(estimatedDelivery);
+	const upstreamUpdatedAt = toIsoDateTime(
+		latestEvent?.time_utc ?? latestEvent?.time_iso ?? detail?.track_time ?? item.track_time ?? detail?.latest_event_time ?? item.latest_event_time,
+	);
+
+	return {
+		type: "upsert" as const,
+		key: trackingKey(item.number, carrier),
+		upstreamUpdatedAt: upstreamUpdatedAt ?? undefined,
+		icon: packageStatusIcon(packageStatus),
+		properties: {
+			Name: Builder.title(item.number),
+			"Carrier Name": Builder.richText(carrier ? carrierNames.get(carrier) ?? "" : ""),
+			"Package Status": Builder.select(packageStatus),
+			"Estimated Delivery Date": estimatedDeliveryParsed ? Builder.date(estimatedDeliveryParsed.date) : Builder.richText(""),
+			"Estimated Delivery Window": Builder.richText(estimatedDeliveryParsed?.window ?? ""),
+			"Latest Event": Builder.richText(
+				firstString(latestEvent?.description_translation?.description, latestEvent?.description, detail?.latest_event_info, item.latest_event_info),
+			),
+			"Latest Event Location": Builder.richText(firstString(latestEvent?.location)),
+			"Latest Event At": optionalDateTime(
+				latestEvent?.time_utc ?? latestEvent?.time_iso ?? detail?.latest_event_time ?? item.latest_event_time,
+			),
+			"Picked Up At": optionalDateTime(detail?.pickup_time ?? item.pickup_time),
+			"Tracking Key": Builder.richText(trackingKey(item.number, carrier)),
+			"Tracking Number": Builder.richText(item.number),
+			"17TRACK URL": Builder.url(trackingUrl(item.number)),
+			"Tracking Status": Builder.select(trackingStatus),
+			"Tracking Active": Builder.checkbox(trackingStatus !== "Stopped"),
+			"Carrier Code": optionalNumber(carrier),
+			"Last-mile Carrier Code": optionalNumber(lastMileCarrier),
+			"Last-mile Carrier Name": Builder.richText(lastMileCarrier ? carrierNames.get(lastMileCarrier) ?? "" : ""),
+			"Origin Country": Builder.richText(firstString(detail?.origin_country, item.origin_country, detail?.shipping_country, item.shipping_country)),
+			"Destination Country": Builder.richText(
+				firstString(detail?.destination_country, item.destination_country, detail?.recipient_country, item.recipient_country),
+			),
+			"Registered At": optionalDateTime(detail?.register_time ?? item.register_time),
+			"Last Tracked At": optionalDateTime(detail?.track_time ?? item.track_time),
+			"Stopped At": optionalDateTime(detail?.stop_track_time ?? item.stop_track_time),
+			"Delivered At": optionalDateTime(detail?.delivery_time ?? detail?.delievery_time ?? item.delivery_time ?? item.delievery_time),
+			"Estimated Delivery Value": Builder.richText(estimatedDeliveryValue),
+			"Estimated Delivery Source": Builder.select(estimatedDeliverySourceName(estimatedDelivery?.source)),
+			"Stop Reason": Builder.select(stopReasonName(detail?.stop_track_reason ?? item.stop_track_reason)),
+			"Retracked": Builder.checkbox(detail?.is_retracked ?? item.is_retracked ?? false),
+			"Carrier Changes": optionalNumber(detail?.carrier_change_count ?? item.carrier_change_count),
+			Remark: Builder.richText(firstString(detail?.remark, item.remark)),
+		},
+	};
+}
+
+async function getTrackedShipmentsPage(page: number): Promise<TrackListPage> {
 	await TRACK17_RATE_LIMIT.wait();
 	const response = await callTrack17<BatchResponse<TrackListItem>>("/gettracklist", {
 		page_no: page,
-		tracking_state: 1,
+		order_by: "RegisterTimeAsc",
 	});
 
-	return response.data.accepted ?? [];
+	return {
+		items: response.data.accepted ?? [],
+		pageTotal: response.page?.page_total,
+	};
 }
 
 async function getTrackInfoFor(items: TrackListItem[]): Promise<TrackInfoItem[]> {
@@ -301,13 +414,63 @@ async function getTrackInfoFor(items: TrackListItem[]): Promise<TrackInfoItem[]>
 			"/gettrackinfo",
 			chunkItems.map((item) => ({
 				number: item.number,
-				...(item.w1 ? { carrier: item.w1 } : {}),
+				...(item.carrier ? { carrier: item.carrier } : {}),
 			})),
 		);
 		results.push(...(response.data.accepted ?? []));
 	}
 
 	return results;
+}
+
+function collectCarrierCodes(items: TrackListItem[], details: TrackInfoItem[]): number[] {
+	const codes = new Set<number>();
+	for (const item of items) {
+		const detail = findTrackInfo(details, item);
+		for (const code of [item.carrier, detail?.carrier, item.final_carrier, detail?.final_carrier]) {
+			if (typeof code === "number" && Number.isFinite(code)) codes.add(code);
+		}
+	}
+	return [...codes];
+}
+
+async function getCarrierNamesFor(codes: number[]): Promise<Map<number, string>> {
+	const missingCodes = codes.filter((code) => !carrierNameCache.has(code));
+	if (missingCodes.length > 0) {
+		try {
+			const carrierList = await getCarrierList();
+			for (const code of missingCodes) {
+				carrierNameCache.set(code, carrierList.get(code) ?? "");
+			}
+		} catch (error) {
+			console.warn("Unable to resolve 17TRACK carrier names.", error);
+			for (const code of missingCodes) carrierNameCache.set(code, "");
+		}
+	}
+
+	return new Map(codes.map((code) => [code, carrierNameCache.get(code) ?? ""]));
+}
+
+async function getCarrierList(): Promise<Map<number, string>> {
+	carrierListPromise ??= fetchCarrierList();
+	return carrierListPromise;
+}
+
+async function fetchCarrierList(): Promise<Map<number, string>> {
+	const response = await fetch(TRACK17_CARRIER_LIST_URL);
+	const text = await response.text();
+	if (!response.ok) {
+		throw new Error(`17TRACK carrier list failed with HTTP ${response.status}: ${text}`);
+	}
+
+	const items = JSON.parse(text) as CarrierListItem[];
+	const carriers = new Map<number, string>();
+	for (const item of items) {
+		if (typeof item.key === "number" && item._name?.trim()) {
+			carriers.set(item.key, item._name.trim());
+		}
+	}
+	return carriers;
 }
 
 async function callTrack17<T>(path: string, body: unknown): Promise<ApiEnvelope<T>> {
@@ -345,10 +508,36 @@ async function callTrack17<T>(path: string, body: unknown): Promise<ApiEnvelope<
 	return parsed;
 }
 
+function getShipmentsSyncSchedule(): Schedule {
+	const raw = process.env[SHIPMENTS_SYNC_SCHEDULE_ENV]?.trim();
+	if (!raw) return DEFAULT_SHIPMENTS_SYNC_SCHEDULE;
+	if (raw === "manual" || raw === "continuous") return raw;
+
+	const match = raw.match(/^(\d+)(m|h|d)$/);
+	if (!match) {
+		throw new Error(
+			`${SHIPMENTS_SYNC_SCHEDULE_ENV} must be "manual", "continuous", or an interval like "30m", "1h", or "1d". Got: ${raw}`,
+		);
+	}
+
+	const value = Number(match[1]);
+	const unit = match[2];
+	const intervalMs = value * (unit === "m" ? 60_000 : unit === "h" ? 3_600_000 : 86_400_000);
+	if (intervalMs < 60_000 || intervalMs > 7 * 86_400_000) {
+		throw new Error(`${SHIPMENTS_SYNC_SCHEDULE_ENV} must be between 1 minute and 7 days. Got: ${raw}`);
+	}
+
+	return raw as Schedule;
+}
+
+function trackListPageSignature(items: TrackListItem[]): string {
+	return items.map((item) => trackingKey(item.number, item.carrier)).join("\n");
+}
+
 function findTrackInfo(details: TrackInfoItem[], item: TrackListItem): TrackInfoItem | undefined {
-	const expectedKey = trackingKey(item.number, item.w1);
+	const expectedKey = trackingKey(item.number, item.carrier);
 	return (
-		details.find((detail) => trackingKey(detail.number, detail.track?.w1) === expectedKey) ??
+		details.find((detail) => trackingKey(detail.number, detail.carrier) === expectedKey) ??
 		details.find((detail) => detail.number === item.number)
 	);
 }
@@ -361,76 +550,60 @@ function trackingUrl(number: string): string {
 	return `https://www.17track.net/en/track-details?nums=${encodeURIComponent(number)}`;
 }
 
-function packageStatusName(code?: number): string {
-	switch (code) {
-		case 0:
-			return "Not found";
-		case 10:
-			return "In transit";
-		case 20:
-			return "Expired";
-		case 30:
-			return "Pick up";
-		case 35:
-			return "Undelivered";
-		case 40:
-			return "Delivered";
-		case 50:
-			return "Alert";
-		default:
-			return "Unknown";
+function packageStatusName(value?: string | number | null): string {
+	if (typeof value === "string") {
+		const normalized = value.trim();
+		if (PACKAGE_STATUS_OPTIONS.some((option) => option.name === normalized)) return normalized;
 	}
+
+	if (typeof value === "number") {
+		switch (value) {
+			case 0:
+				return "NotFound";
+			case 10:
+				return "InTransit";
+			case 20:
+				return "Expired";
+			case 30:
+				return "AvailableForPickup";
+			case 35:
+				return "DeliveryFailure";
+			case 40:
+				return "Delivered";
+			case 50:
+				return "Exception";
+		}
+	}
+
+	return "Unknown";
 }
 
-function trackingStatusName(code?: number): string {
-	switch (code) {
-		case 0:
-			return "Unable to track";
-		case 1:
-			return "Normal tracking";
-		case 2:
-			return "Not found";
-		case 10:
-			return "Web error";
-		case 11:
-			return "Process error";
-		case 12:
-			return "Service error";
-		case 20:
-			return "Web error (cache)";
-		case 21:
-			return "Process error (cache)";
-		case 22:
-			return "Service error (cache)";
-		default:
-			return "Unknown";
-	}
+function trackingStatusName(value?: string | null): string {
+	const normalized = value?.trim();
+	return normalized === "Tracking" || normalized === "Stopped" ? normalized : "Unknown";
 }
 
-function stopReasonName(code?: number): string {
-	switch (code) {
-		case 1:
-			return "Expiration rules";
-		case 2:
-			return "API request";
-		case 3:
-			return "Manual operation";
-		case 4:
-			return "Invalid carrier";
-		default:
-			return "None";
-	}
+function stopReasonName(value?: string | null): string {
+	const normalized = value?.trim();
+	return normalized === "Expired" || normalized === "ByRequest" || normalized === "InvalidCarrier" ? normalized : "None";
 }
 
-function packageStatusIcon(code?: number) {
-	switch (code) {
-		case 40:
+function estimatedDeliverySourceName(value?: string | null): string {
+	const normalized = value?.trim();
+	if (!normalized) return "None";
+	return normalized === "Official" || normalized === "17TRACK" ? normalized : "Unknown";
+}
+
+function packageStatusIcon(status: string) {
+	switch (status) {
+		case "Delivered":
 			return Builder.emojiIcon("✅");
-		case 50:
-		case 35:
+		case "Exception":
+		case "DeliveryFailure":
 			return Builder.emojiIcon("⚠️");
-		case 10:
-		case 30:
+		case "InTransit":
+		case "AvailableForPickup":
+		case "OutForDelivery":
 			return Builder.emojiIcon("🚚");
 		default:
 			return Builder.emojiIcon("📦");
@@ -441,17 +614,102 @@ function optionalNumber(value?: number) {
 	return typeof value === "number" && Number.isFinite(value) ? Builder.number(value) : Builder.richText("");
 }
 
-function optionalDateTime(value?: string) {
+function optionalDateTime(value?: string | null) {
 	const iso = toIsoDateTime(value);
-	return iso ? Builder.dateTime(iso, "UTC") : Builder.richText("");
+	return iso ? Builder.dateTime(iso) : Builder.richText("");
 }
 
-function toIsoDateTime(value?: string): string | null {
+type ParsedEstimatedDelivery = {
+	date: string;
+	window: string;
+};
+
+function parseEstimatedDelivery(value?: EstimatedDeliveryDate | null): ParsedEstimatedDelivery | null {
+	const rawValue = estimatedDeliveryRawValue(value);
+	const displayRange = parseDisplayEstimatedDeliveryValue(rawValue);
+	if (displayRange) return displayRange;
+
+	const from = parseEstimatedDeliveryEndpoint(value?.from);
+	const to = parseEstimatedDeliveryEndpoint(value?.to);
+	if (!from || !to || from.date !== to.date) return null;
+
+	return {
+		date: from.date,
+		window: `${formatTimeWindowEndpoint(from)} → ${formatTimeWindowEndpoint(to)}`,
+	};
+}
+
+function estimatedDeliveryRawValue(value?: EstimatedDeliveryDate | null): string {
+	const from = value?.from?.trim();
+	const to = value?.to?.trim();
+	if (from && to) return `${from} → ${to}`;
+	return from ?? to ?? "";
+}
+
+function parseEstimatedDeliveryEndpoint(value?: string | null): { date: string; hour: number; minute: number } | null {
+	const trimmed = value?.trim();
+	if (!trimmed) return null;
+
+	const match = trimmed.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{1,2}):(\d{2})(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$/);
+	if (!match) return null;
+
+	const hour = Number(match[2]);
+	const minute = Number(match[3]);
+	if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+
+	return { date: match[1], hour, minute };
+}
+
+function parseDisplayEstimatedDeliveryValue(value: string): ParsedEstimatedDelivery | null {
+	const match = value.match(
+		/^(January|February|March|April|May|June|July|August|September|October|November|December) (\d{1,2}), (\d{4}) (\d{1,2}:\d{2} [AP]M) → (\d{1,2}:\d{2} [AP]M)$/,
+	);
+	if (!match) return null;
+
+	const month = monthNumber(match[1]);
+	const day = Number(match[2]);
+	const year = Number(match[3]);
+	if (!month || day < 1 || day > 31) return null;
+
+	return {
+		date: `${year}-${month}-${String(day).padStart(2, "0")}`,
+		window: `${match[4]} → ${match[5]}`,
+	};
+}
+
+function monthNumber(month: string): string | null {
+	const index = [
+		"January",
+		"February",
+		"March",
+		"April",
+		"May",
+		"June",
+		"July",
+		"August",
+		"September",
+		"October",
+		"November",
+		"December",
+	].indexOf(month);
+	return index === -1 ? null : String(index + 1).padStart(2, "0");
+}
+
+function formatTimeWindowEndpoint(value: { hour: number; minute: number }): string {
+	const period = value.hour >= 12 ? "PM" : "AM";
+	const hour = value.hour % 12 || 12;
+	return `${hour}:${String(value.minute).padStart(2, "0")} ${period}`;
+}
+
+function toIsoDateTime(value?: string | null): string | null {
 	const trimmed = value?.trim();
 	if (!trimmed || trimmed.startsWith("2079-01-01")) return null;
 
-	const dateTimeMatch = trimmed.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(?::\d{2})?/);
-	if (dateTimeMatch) return `${dateTimeMatch[1]}T${dateTimeMatch[2]}:00Z`;
+	const parsed = Date.parse(trimmed);
+	if (Number.isFinite(parsed)) return new Date(parsed).toISOString();
+
+	const dateTimeMatch = trimmed.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(?::(\d{2}))?/);
+	if (dateTimeMatch) return `${dateTimeMatch[1]}T${dateTimeMatch[2]}:${dateTimeMatch[3] ?? "00"}Z`;
 
 	const dateMatch = trimmed.match(/^(\d{4}-\d{2}-\d{2})$/);
 	if (dateMatch) return `${dateMatch[1]}T00:00:00Z`;
@@ -461,6 +719,14 @@ function toIsoDateTime(value?: string): string | null {
 
 function firstNumber(...values: Array<number | undefined>): number | undefined {
 	return values.find((value) => typeof value === "number" && Number.isFinite(value));
+}
+
+function firstString(...values: Array<string | null | undefined>): string {
+	for (const value of values) {
+		const trimmed = value?.trim();
+		if (trimmed) return trimmed;
+	}
+	return "";
 }
 
 function chunk<T>(items: T[], size: number): T[][] {

@@ -1,7 +1,9 @@
 {
 	"name": "17track-worker",
-	"version": "0.0.0",
+	"version": "0.1.0",
+	"description": "Self-deployable Notion Worker for syncing 17TRACK shipments.",
 	"private": true,
+	"license": "GPL-3.0-only",
 	"scripts": {
 		"build": "tsc",
 		"check": "tsc --noEmit"
