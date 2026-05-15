@@ -186,7 +186,7 @@ Synced properties include tracking number, 17TRACK URL, package status, tracking
 - Estimated delivery is read from `track_info.time_metrics.estimated_delivery_date`; the raw `from`/`to` value is synced into `Estimated Delivery Value`, and `Estimated Delivery Date` plus `Estimated Delivery Window` are only filled when the range parses successfully.
 - `searchCarrierCodes` reads `https://res.17track.net/asset/carrier/info/apicarrier.all.json` and returns matching carrier codes.
 - `addTrackingNumber` writes to `/register` with 17TRACK carrier auto-detection enabled and returns accepted/rejected records from 17TRACK.
-- `addTrackingNumberWithCarrier` writes to `/register` with an explicit carrier code and returns accepted/rejected records from 17TRACK.
+- `addTrackingNumberWithCarrier` writes to `/register` with an explicit carrier code from `searchCarrierCodes` and returns accepted/rejected records from 17TRACK.
 - `removeTrackingNumber` writes to `/deletetrack` and returns accepted/rejected records from 17TRACK; deletion is irreversible in 17TRACK, and the record disappears from Notion on the next replace-mode sync.
 
 ## Troubleshooting
